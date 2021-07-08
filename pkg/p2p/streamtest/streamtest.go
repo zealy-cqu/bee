@@ -254,7 +254,7 @@ func (s *stream) ResponseHeaders() p2p.Headers {
 }
 
 func (s *stream) Close() error {
-	return s.in.Close()
+	return s.in.WriteClose()
 }
 
 func (s *stream) FullClose() error {
@@ -266,7 +266,7 @@ func (s *stream) FullClose() error {
 	waitStart := time.Now()
 
 	for {
-		if s.out.Closed() {
+		if s.out.ReadClosed() {
 			return nil
 		}
 
@@ -279,20 +279,21 @@ func (s *stream) FullClose() error {
 }
 
 func (s *stream) Reset() (err error) {
-	if err := s.in.Close(); err != nil {
-		_ = s.out.Close()
+	if err := s.in.WriteClose(); err != nil {
+		_ = s.out.ReadClose()
 		return err
 	}
 
-	return s.out.Close()
+	return s.out.ReadClose()
 }
 
 type record struct {
-	b       []byte
-	c       int
-	closed  bool
-	closeMu sync.RWMutex
-	cond    *sync.Cond
+	b          []byte
+	c          int
+	readclose  bool
+	writeclose bool
+	closeMu    sync.RWMutex
+	cond       *sync.Cond
 }
 
 func newRecord() *record {
@@ -305,7 +306,7 @@ func (r *record) Read(p []byte) (n int, err error) {
 	r.cond.L.Lock()
 	defer r.cond.L.Unlock()
 
-	for r.c == len(r.b) && !r.Closed() {
+	for r.c == len(r.b) && !r.ReadClosed() {
 		r.cond.Wait()
 	}
 	end := r.c + len(p)
@@ -314,7 +315,7 @@ func (r *record) Read(p []byte) (n int, err error) {
 	}
 	n = copy(p, r.b[r.c:end])
 	r.c += n
-	if r.Closed() {
+	if r.ReadClosed() {
 		err = io.EOF
 	}
 
@@ -324,7 +325,7 @@ func (r *record) Read(p []byte) (n int, err error) {
 func (r *record) Write(p []byte) (int, error) {
 	r.cond.L.Lock()
 	defer r.cond.L.Unlock()
-	if r.Closed() {
+	if r.WriteClosed() {
 		return 0, ErrStreamClosed
 	}
 
@@ -334,23 +335,42 @@ func (r *record) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (r *record) Close() error {
+func (r *record) ReadClose() error {
 	r.cond.L.Lock()
 	defer r.cond.L.Unlock()
 
 	defer r.cond.Broadcast()
 
 	r.closeMu.Lock()
-	r.closed = true
+	r.readclose = true
 	r.closeMu.Unlock()
 
 	return nil
 }
 
-func (r *record) Closed() bool {
+func (r *record) WriteClose() error {
+	r.cond.L.Lock()
+	defer r.cond.L.Unlock()
+
+	defer r.cond.Broadcast()
+
+	r.closeMu.Lock()
+	r.writeclose = true
+	r.closeMu.Unlock()
+
+	return nil
+}
+
+func (r *record) ReadClosed() bool {
 	r.closeMu.RLock()
 	defer r.closeMu.RUnlock()
-	return r.closed
+	return r.readclose
+}
+
+func (r *record) WriteClosed() bool {
+	r.closeMu.RLock()
+	defer r.closeMu.RUnlock()
+	return r.writeclose
 }
 
 func (r *record) bytes() []byte {
